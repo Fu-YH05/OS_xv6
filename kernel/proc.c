@@ -34,14 +34,14 @@ procinit(void)
       // Allocate a page for the process's kernel stack.
       // Map it high in memory, followed by an invalid
       // guard page.
-      char *pa = kalloc();
-      if(pa == 0)
-        panic("kalloc");
-      uint64 va = KSTACK((int) (p - proc));
-      kvmmap(va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
-      p->kstack = va;
+      //char *pa = kalloc();
+      //if(pa == 0)
+        //panic("kalloc");
+      //uint64 va = KSTACK((int) (p - proc));
+      //kvmmap(va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
+      //p->kstack = va;
   }
-  kvminithart();
+  //kvminithart();
 }
 
 // Must be called with interrupts disabled,
@@ -106,6 +106,31 @@ allocproc(void)
 
 found:
   p->pid = allocpid();
+  p->state = USED;
+  
+  // [新增] 初始化该进程的专属内核页表
+  p->kpagetable = proc_kpt_init();
+  if(p->kpagetable == 0){
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+
+  // [新增] 为进程分配物理内核栈，并映射到它自己的内核页表里
+  char *pa = kalloc();
+  if(pa == 0){
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+  uint64 va = KSTACK((int)(p - proc));
+  if(mappages(p->kpagetable, va, PGSIZE, (uint64)pa, PTE_R | PTE_W) != 0){
+    kfree(pa);
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+  p->kstack = va;
 
   // Allocate a trapframe page.
   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
@@ -142,6 +167,21 @@ freeproc(struct proc *p)
   if(p->pagetable)
     proc_freepagetable(p->pagetable, p->sz);
   p->pagetable = 0;
+  // [新增] 释放物理内存中的内核栈
+  if(p->kstack) {
+    pte_t *pte = walk(p->kpagetable, p->kstack, 0);
+    if(pte && (*pte & PTE_V)) {
+      uint64 pa = PTE2PA(*pte);
+      kfree((void*)pa); // 释放物理页
+    }
+  }
+  p->kstack = 0;
+
+  // [新增] 释放独立内核页表
+  if(p->kpagetable) {
+    proc_free_kpt(p->kpagetable);
+  }
+  p->kpagetable = 0;
   p->sz = 0;
   p->pid = 0;
   p->parent = 0;
@@ -221,6 +261,8 @@ userinit(void)
   uvminit(p->pagetable, initcode, sizeof(initcode));
   p->sz = PGSIZE;
 
+  u2kvm_copy(p->pagetable, p->kpagetable, 0, p->sz);
+
   // prepare for the very first "return" from kernel to user.
   p->trapframe->epc = 0;      // user program counter
   p->trapframe->sp = PGSIZE;  // user stack pointer
@@ -243,11 +285,14 @@ growproc(int n)
 
   sz = p->sz;
   if(n > 0){
+    if(sz + n >= PLIC) return -1;
     if((sz = uvmalloc(p->pagetable, sz, sz + n)) == 0) {
       return -1;
     }
+    u2kvm_copy(p->pagetable, p->kpagetable, p->sz, sz);
   } else if(n < 0){
     sz = uvmdealloc(p->pagetable, sz, sz + n);
+    uvmunmap(p->kpagetable, PGROUNDUP(sz), (PGROUNDUP(p->sz) - PGROUNDUP(sz)) / PGSIZE, 0);
   }
   p->sz = sz;
   return 0;
@@ -274,6 +319,8 @@ fork(void)
     return -1;
   }
   np->sz = p->sz;
+
+  u2kvm_copy(np->pagetable, np->kpagetable, 0, np->sz);
 
   np->parent = p;
 
@@ -473,7 +520,13 @@ scheduler(void)
         // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
+        // [新增] 切换为该进程专属的内核页表
+        w_satp(MAKE_SATP(p->kpagetable));
+        sfence_vma(); // 刷新 TLB 缓存
+        
         swtch(&c->context, &p->context);
+        // [新增] 进程切换回来后，切回全局的默认内核页表
+        kvminithart();
 
         // Process is done running for now.
         // It should have changed its p->state before coming back.

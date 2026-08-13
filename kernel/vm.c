@@ -5,6 +5,9 @@
 #include "riscv.h"
 #include "defs.h"
 #include "fs.h"
+#include "spinlock.h"
+#include "proc.h"
+
 
 /*
  * the kernel's page table.
@@ -132,7 +135,7 @@ kvmpa(uint64 va)
   pte_t *pte;
   uint64 pa;
   
-  pte = walk(kernel_pagetable, va, 0);
+  pte = walk(myproc()->kpagetable, va, 0);
   if(pte == 0)
     panic("kvmpa");
   if((*pte & PTE_V) == 0)
@@ -379,7 +382,7 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 int
 copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
 {
-  uint64 n, va0, pa0;
+  /*uint64 n, va0, pa0;
 
   while(len > 0){
     va0 = PGROUNDDOWN(srcva);
@@ -395,7 +398,8 @@ copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
     dst += n;
     srcva = va0 + PGSIZE;
   }
-  return 0;
+  return 0;*/
+  return copyin_new(pagetable, dst, srcva, len);
 }
 
 // Copy a null-terminated string from user to kernel.
@@ -405,7 +409,7 @@ copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
 int
 copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
 {
-  uint64 n, va0, pa0;
+  /*uint64 n, va0, pa0;
   int got_null = 0;
 
   while(got_null == 0 && max > 0){
@@ -438,5 +442,96 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
     return 0;
   } else {
     return -1;
+  }*/
+  return copyinstr_new(pagetable, dst, srcva, max);
+}
+
+// 辅助递归函数
+void vmprint_helper(pagetable_t pagetable, int level) {
+  for(int i = 0; i < 512; i++){
+    pte_t pte = pagetable[i];
+    // 只有当页表项有效时才打印
+    if(pte & PTE_V){
+      
+      for(int j = 0; j < level; j++){
+        if(j > 0) printf(" ");
+        printf("..");
+      }
+      
+      uint64 pa = PTE2PA(pte);
+      
+      printf("%d: pte %p pa %p\n", i, (void*)pte, (void*)pa);
+      
+      // 如果不是叶子节点，继续向下递归遍历
+      if((pte & (PTE_R|PTE_W|PTE_X)) == 0){
+        vmprint_helper((pagetable_t)pa, level + 1);
+      }
+    }
+  }
+}
+
+// 打印主入口
+void vmprint(pagetable_t pagetable) {
+  printf("page table %p\n", (void*)pagetable);
+  vmprint_helper(pagetable, 1);
+}
+
+// [新增] 初始化进程专用的内核页表
+pagetable_t proc_kpt_init(void)
+{
+  pagetable_t kpt = (pagetable_t) kalloc();
+  if(kpt == 0) return 0;
+  memset(kpt, 0, PGSIZE);
+
+  // 仿照 kvmmake() 映射内核运行所必需的硬件和代码段
+  // 注意：无需映射 CLINT（只有内核启动时需要）
+  mappages(kpt, UART0, PGSIZE, UART0, PTE_R | PTE_W);
+  mappages(kpt, VIRTIO0, PGSIZE, VIRTIO0, PTE_R | PTE_W);
+  mappages(kpt, PLIC, 0x400000, PLIC, PTE_R | PTE_W);
+  mappages(kpt, KERNBASE, (uint64)etext - KERNBASE, KERNBASE, PTE_R | PTE_X);
+  mappages(kpt, (uint64)etext, PHYSTOP - (uint64)etext, (uint64)etext, PTE_R | PTE_W);
+  mappages(kpt, TRAMPOLINE, PGSIZE, (uint64)trampoline, PTE_R | PTE_X);
+
+  return kpt;
+}
+
+// [新增] 释放进程专属的内核页表（只释放页表自身的内存，不释放叶子节点的物理内存）
+void proc_free_kpt(pagetable_t kpt)
+{
+  for(int i = 0; i < 512; i++){
+    pte_t pte = kpt[i];
+    if(pte & PTE_V){
+      // 如果这不是叶子节点（即它是更深一层的页目录）
+      if((pte & (PTE_R|PTE_W|PTE_X)) == 0){
+        uint64 child = PTE2PA(pte);
+        proc_free_kpt((pagetable_t)child); // 递归释放
+      }
+      kpt[i] = 0;
+    }
+  }
+  kfree((void*)kpt);
+}
+
+// [新增] 将用户页表的映射复制到内核页表中
+void
+u2kvm_copy(pagetable_t upgtbl, pagetable_t kpgtbl, uint64 oldsz, uint64 newsz)
+{
+  pte_t *pte;
+  uint64 pa, i;
+  uint flags;
+
+  oldsz = PGROUNDUP(oldsz);
+  for(i = oldsz; i < newsz; i += PGSIZE){
+    if((pte = walk(upgtbl, i, 0)) == 0) panic("u2kvm_copy: pte missing");
+    if((*pte & PTE_V) == 0) panic("u2kvm_copy: invalid pte");
+    
+    pa = PTE2PA(*pte);
+    // [关键] 必须剥离 PTE_U 权限位！
+    // 否则 RISC-V 处于 Supervisor 模式下时，硬件会拒绝访问带有 User 标记的内存。
+    flags = PTE_FLAGS(*pte) & (~PTE_U); 
+    
+    if(mappages(kpgtbl, i, PGSIZE, pa, flags) != 0) {
+      panic("u2kvm_copy: mappages failed");
+    }
   }
 }
