@@ -14,6 +14,8 @@ struct entry {
   struct entry *next;
 };
 struct entry *table[NBUCKET];
+// 为每个桶定义一个互斥锁
+pthread_mutex_t locks[NBUCKET];
 int keys[NKEYS];
 int nthread = 1;
 
@@ -40,6 +42,9 @@ void put(int key, int value)
 {
   int i = key % NBUCKET;
 
+  // 锁定当前需要操作的哈希桶
+  pthread_mutex_lock(&locks[i]);
+
   // is the key already present?
   struct entry *e = 0;
   for (e = table[i]; e != 0; e = e->next) {
@@ -53,6 +58,8 @@ void put(int key, int value)
     // the new is new.
     insert(key, value, &table[i], table[i]);
   }
+  // 操作完成，解锁
+  pthread_mutex_unlock(&locks[i]);
 }
 
 static struct entry*
@@ -102,6 +109,11 @@ main(int argc, char *argv[])
   pthread_t *tha;
   void *value;
   double t1, t0;
+
+  // 在 main 函数最开头初始化这 5 个桶的锁
+  for (int i = 0; i < NBUCKET; i++) {
+    pthread_mutex_init(&locks[i], NULL);
+  }
 
   if (argc < 2) {
     fprintf(stderr, "Usage: %s nthreads\n", argv[0]);

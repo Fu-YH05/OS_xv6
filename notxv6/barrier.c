@@ -30,7 +30,28 @@ barrier()
   // Block until all threads have called barrier() and
   // then increment bstate.round.
   //
+  // 1. 获取屏障锁，保证对共享状态（nthread, round）的修改是互斥的
+  pthread_mutex_lock(&bstate.barrier_mutex);
   
+  // 2. 当前抵达屏障的线程数 + 1
+  bstate.nthread++;
+  
+  // 3. 判断是不是最后一个抵达的线程
+  if (bstate.nthread == nthread) {
+    // 如果是，开启下一回合
+    bstate.round++;
+    // 将计数器清零，留给下一回合使用
+    bstate.nthread = 0; 
+    // [关键] 唤醒所有正在等待该条件变量的线程
+    pthread_cond_broadcast(&bstate.barrier_cond); 
+  } else {
+    // 如果不是最后一个线程，则挂起自身，释放互斥锁，进入等待队列
+    // 当被 broadcast 唤醒时，会自动重新获取互斥锁往下执行
+    pthread_cond_wait(&bstate.barrier_cond, &bstate.barrier_mutex);
+  }
+  
+  // 4. 所有线程都会执行到这里（无论是最后一个线程，还是被唤醒的等待线程），释放锁
+  pthread_mutex_unlock(&bstate.barrier_mutex);
 }
 
 static void *
