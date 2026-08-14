@@ -102,7 +102,43 @@ e1000_transmit(struct mbuf *m)
   // the TX descriptor ring so that the e1000 sends it. Stash
   // a pointer so that it can be freed after sending.
   //
-  
+  // 1. 获取 E1000 发送锁，保证并发安全
+  acquire(&e1000_lock);
+
+  // 2. 获取当前的发送环索引 (TDT: Transmit Descriptor Tail)
+  uint32 idx = regs[E1000_TDT];
+
+  // 3. 检查环形缓冲区是否已满：判断该位置上一次的数据是否已经被硬件发送完毕 (DD 位)
+  if((tx_ring[idx].status & E1000_TXD_STAT_DD) == 0) {
+    // DD 位没置 1，说明硬件还在忙，环满了
+    release(&e1000_lock);
+    return -1;
+  }
+
+  // 4. 如果这个位置之前残留着上一次发送的 mbuf，将其释放
+  if(tx_mbufs[idx]) {
+    mbuffree(tx_mbufs[idx]);
+    tx_mbufs[idx] = 0;
+  }
+
+  // 5. 将新的 mbuf 的物理地址和长度填入描述符
+  tx_ring[idx].addr = (uint64)m->head;
+  tx_ring[idx].length = m->len;
+
+  // 设置命令标志位：
+  // EOP (End Of Packet): 表示这是一个完整的包
+  // RS (Report Status): 告诉网卡在发送完成后，将 status 的 DD 位置为 1
+  tx_ring[idx].cmd = E1000_TXD_CMD_EOP | E1000_TXD_CMD_RS;
+
+  // 6. 把新 mbuf 的指针记录在 tx_mbufs 中，防止内存泄漏，下次好释放
+  tx_mbufs[idx] = m;
+
+  // 7. 更新 TDT 寄存器，通知网卡硬件开始发送
+  regs[E1000_TDT] = (idx + 1) % TX_RING_SIZE;
+
+  // 8. 释放锁
+  release(&e1000_lock);
+
   return 0;
 }
 
@@ -115,6 +151,40 @@ e1000_recv(void)
   // Check for packets that have arrived from the e1000
   // Create and deliver an mbuf for each packet (using net_rx()).
   //
+  // 一次中断可能收到多个包，循环读取直到没有新包为止
+  while (1) {
+    // 1. 获取下一个要读取的环索引 (RDT 指向最后被消费的，所以要 +1)
+    uint32 idx = (regs[E1000_RDT] + 1) % RX_RING_SIZE;
+
+    // 2. 检查该描述符是否有新数据到达 (判断 DD 位)
+    if((rx_ring[idx].status & E1000_RXD_STAT_DD) == 0) {
+      // 没有新数据了，退出循环
+      break;
+    }
+
+    // 3. 取出装有新数据的 mbuf
+    struct mbuf *m = rx_mbufs[idx];
+
+    // 4. 更新 mbuf 的有效数据长度
+    m->len = rx_ring[idx].length;
+
+    // 5. 将数据包上传给网络协议栈 (net_rx 内部会负责处理该包，无需我们释放)
+    net_rx(m);
+
+    // 6. 为该槽位重新分配一个新的空白 mbuf，供网卡将来接收新数据使用
+    m = mbufalloc(0);
+    if (!m) {
+      panic("e1000_recv: mbufalloc failed");
+    }
+    rx_mbufs[idx] = m;
+
+    // 7. 更新描述符，指向新的 mbuf 地址，并清空 status
+    rx_ring[idx].addr = (uint64)m->head;
+    rx_ring[idx].status = 0;
+
+    // 8. 更新 RDT 寄存器，告诉网卡这个槽位可以再次写入了
+    regs[E1000_RDT] = idx;
+  }
 }
 
 void
