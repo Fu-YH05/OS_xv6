@@ -67,6 +67,16 @@ usertrap(void)
     syscall();
   } else if((which_dev = devintr()) != 0){
     // ok
+  } else if(r_scause() == 13 || r_scause() == 15) {
+    // 拦截并处理 mmap 的 Page Fault
+    uint64 fault_va = r_stval();
+    if(fault_va >= p->sz && fault_va < MAXVA) { 
+      if(handle_mmap_page_fault(fault_va) < 0) {
+        p->killed = 1; // 映射失败（如OOM）直接杀死进程
+      }
+    } else {
+      p->killed = 1; // 越界访问
+    }
   } else {
     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
     printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());

@@ -484,3 +484,163 @@ sys_pipe(void)
   }
   return 0;
 }
+
+// mmap 系统调用
+uint64
+sys_mmap(void)
+{
+  uint64 addr, length, offset;
+  int prot, flags, fd;
+
+  // 获取 6 个参数
+  if(argaddr(0, &addr) < 0 || argaddr(1, &length) < 0 || argint(2, &prot) < 0 ||
+     argint(3, &flags) < 0 || argint(4, &fd) < 0 || argaddr(5, &offset) < 0)
+    return -1;
+
+  struct proc *p = myproc();
+  struct file *f = p->ofile[fd];
+  
+  // 权限合法性检查
+  if(f == 0 || f->readable == 0) return -1;
+  if((prot & PROT_WRITE) && (flags & MAP_SHARED) && f->writable == 0) return -1;
+
+  // 寻找空闲的 VMA 槽位
+  struct vma *v = 0;
+  for(int i = 0; i < NVMA; i++) {
+    if(p->vma[i].valid == 0) {
+      v = &p->vma[i];
+      break;
+    }
+  }
+  if(v == 0) return -1;
+
+  // 寻找可用的高位虚拟地址（避开 heap，从 MAXVA 向下寻找）
+  uint64 curr_addr = MAXVA - 2 * PGSIZE; // 留出 trapframe 和 trampoline 的空间
+  for(int i = 0; i < NVMA; i++) {
+    if(p->vma[i].valid && p->vma[i].addr < curr_addr) {
+      curr_addr = p->vma[i].addr;
+    }
+  }
+  
+  // 记录 VMA 信息（此时不分配物理内存）
+  v->addr = curr_addr - PGROUNDUP(length);
+  v->length = length;
+  v->prot = prot;
+  v->flags = flags;
+  v->vfile = f;
+  v->offset = offset;
+  v->valid = 1;
+
+  filedup(f); // 增加文件的引用计数
+  
+  return v->addr;
+}
+
+// 执行解除映射与写回逻辑的辅助函数
+int
+do_munmap(struct proc *p, uint64 addr, uint64 length)
+{
+  struct vma *v = 0;
+  for(int i = 0; i < NVMA; i++) {
+    if(p->vma[i].valid && addr >= p->vma[i].addr && addr < p->vma[i].addr + p->vma[i].length) {
+      v = &p->vma[i];
+      break;
+    }
+  }
+  if(v == 0) return -1;
+
+  // 如果是 SHARED 模式，必须将修改过（Dirty）的页面写回磁盘
+  if(v->flags & MAP_SHARED) {
+    for(uint64 a = addr; a < addr + length; a += PGSIZE) {
+      pte_t *pte = walk(p->pagetable, a, 0);
+      if(pte && (*pte & PTE_V) && (*pte & PTE_D)) { // 检查页面是否有效且被弄脏过
+        begin_op();
+        ilock(v->vfile->ip);
+        // 写回文件
+        writei(v->vfile->ip, 1, a, v->offset + (a - v->addr), PGSIZE);
+        iunlock(v->vfile->ip);
+        end_op();
+        *pte &= ~PTE_D; // 清除脏位
+      }
+    }
+  }
+
+  // 解除内存映射（真正的物理页释放）
+  uvmunmap(p->pagetable, addr, PGROUNDUP(length) / PGSIZE, 1);
+
+  // 调整 VMA 记录（支持从头部或尾部 partial unmap）
+  if(addr == v->addr) {
+    v->addr += length;
+    v->length -= length;
+    v->offset += length;
+  } else {
+    v->length -= length;
+  }
+
+  // 如果该 VMA 已经被完全解除，则释放槽位
+  if(v->length <= 0) {
+    fileclose(v->vfile);
+    v->valid = 0;
+  }
+  return 0;
+}
+
+// munmap 系统调用
+uint64
+sys_munmap(void)
+{
+  uint64 addr, length;
+  if(argaddr(0, &addr) < 0 || argaddr(1, &length) < 0) return -1;
+  return do_munmap(myproc(), addr, length);
+}
+
+// mmap 懒加载处理
+int handle_mmap_page_fault(uint64 va)
+{
+  struct proc *p = myproc();
+  struct vma *v = 0;
+  
+  // 查找出问题的虚拟地址属于哪个 VMA
+  for(int i = 0; i < NVMA; i++) {
+    if(p->vma[i].valid && va >= p->vma[i].addr && va < p->vma[i].addr + p->vma[i].length) {
+      v = &p->vma[i];
+      break;
+    }
+  }
+  if(v == 0) return -1; // 不属于 mmap 区域
+
+  // 分配新的物理页
+  char *mem = kalloc();
+  if(mem == 0) return -1;
+  memset(mem, 0, PGSIZE);
+
+  // 从文件中读取该页对应的内容
+  begin_op();
+  ilock(v->vfile->ip);
+  uint64 offset = v->offset + PGROUNDDOWN(va) - v->addr;
+  readi(v->vfile->ip, 0, (uint64)mem, offset, PGSIZE);
+  iunlock(v->vfile->ip);
+  end_op();
+
+  // 根据 VMA 设置页表权限
+  int flags = PTE_U;
+  if(v->prot & PROT_READ) flags |= PTE_R;
+  if(v->prot & PROT_WRITE) flags |= PTE_W;
+  if(v->prot & PROT_EXEC) flags |= PTE_X;
+
+  // 将物理页映射到发生缺页的虚拟地址
+  if(mappages(p->pagetable, PGROUNDDOWN(va), PGSIZE, (uint64)mem, flags) != 0) {
+    kfree(mem);
+    return -1;
+  }
+  return 0;
+}
+
+// 进程退出时，清理所有 VMA 并写回文件
+void vma_exit(struct proc *p) {
+  for(int i = 0; i < NVMA; i++) {
+    if(p->vma[i].valid) {
+      do_munmap(p, p->vma[i].addr, p->vma[i].length);
+    }
+  }
+}

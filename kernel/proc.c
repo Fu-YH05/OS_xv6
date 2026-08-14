@@ -113,6 +113,12 @@ allocproc(void)
 
 found:
   p->pid = allocpid();
+  p->state = UNUSED;
+  
+  // 初始化 VMA 为无效状态
+  for(int i = 0; i < NVMA; i++) {
+    p->vma[i].valid = 0;
+  }
 
   // Allocate a trapframe page.
   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
@@ -298,6 +304,14 @@ fork(void)
 
   safestrcpy(np->name, p->name, sizeof(p->name));
 
+  // 将 VMA 结构复制给子进程
+  for(int i = 0; i < NVMA; i++) {
+    if(p->vma[i].valid) {
+      np->vma[i] = p->vma[i];
+      filedup(p->vma[i].vfile); // 为继承的文件描述符增加引用计数
+    }
+  }
+
   pid = np->pid;
 
   np->state = RUNNABLE;
@@ -343,6 +357,9 @@ exit(int status)
 
   if(p == initproc)
     panic("init exiting");
+
+  // 关闭所有已映射的 VMA
+  vma_exit(p);
 
   // Close all open files.
   for(int fd = 0; fd < NOFILE; fd++){
