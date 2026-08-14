@@ -102,5 +102,11 @@ struct proc {
   struct context context;      // swtch() here to run process
   struct file *ofile[NOFILE];  // Open files
   struct inode *cwd;           // Current directory
-  char name[16];               // Process name (debugging)
+  char name[16];   
+  // 报警器相关属性
+  int alarm_interval;               // 报警间隔 tick 数 (0 表示禁用)
+  void (*alarm_handler)();          // 用户空间的报警处理函数地址
+  int alarm_ticks;                  // 自上次报警后累积经过的 tick 数
+  int is_alarming;                  // 防重入标志位（1 表示正在处理报警）
+  struct trapframe *alarm_trapframe;// 专门保存报警打断瞬间的用户寄存器状态            // Process name (debugging)
 };

@@ -77,9 +77,25 @@ usertrap(void)
     exit(-1);
 
   // give up the CPU if this is a timer interrupt.
-  if(which_dev == 2)
+  if(which_dev == 2){
+    // [新增] 处理时钟警报逻辑
+    if(p->alarm_interval != 0 && p->is_alarming == 0) {
+      p->alarm_ticks++;
+      if(p->alarm_ticks >= p->alarm_interval) {
+        // 触发报警
+        p->is_alarming = 1;
+        p->alarm_ticks = 0;
+        
+        // 备份当前的陷入帧（里面有所有的用户态寄存器和原本马上要返回执行的 PC (epc)）
+        memmove(p->alarm_trapframe, p->trapframe, sizeof(struct trapframe));
+        
+        // 篡改返回地址：将 PC 指向用户设定的 handler。
+        // 这样 usertrap 返回用户态时，就会跳转去执行 handler 而不是原来执行到一半的代码
+        p->trapframe->epc = (uint64)p->alarm_handler;
+      }
+    }
     yield();
-
+  }
   usertrapret();
 }
 
