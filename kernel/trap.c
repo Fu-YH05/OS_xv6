@@ -67,6 +67,30 @@ usertrap(void)
     syscall();
   } else if((which_dev = devintr()) != 0){
     // ok
+  } else if(r_scause() == 13 || r_scause() == 15) {
+    // [新增] 处理 Page Fault（Lazy Allocation）
+    uint64 va = r_stval(); // 获取发生缺页的虚拟地址
+    
+    // 边界检查：
+    // 1. va >= p->sz：地址超出了进程申请的最大堆内存
+    // 2. va < p->trapframe->sp：地址低于用户栈底（极大概率是碰到了 guard page 无效页）
+    if(va >= p->sz|| va < PGROUNDDOWN(p->trapframe->sp)) {
+      p->killed = 1; // 违规访问，直接杀死进程
+    } else {
+      // 申请一个物理页
+      char *mem = kalloc();
+      if(mem == 0) {
+        // OOM (Out of Memory) 内存耗尽
+        p->killed = 1;
+      } else {
+        memset(mem, 0, PGSIZE);
+        // 将新申请的物理页映射到发生缺页的虚拟地址上
+        if(mappages(p->pagetable, PGROUNDDOWN(va), PGSIZE, (uint64)mem, PTE_W|PTE_X|PTE_R|PTE_U) != 0){
+          kfree(mem); // 映射失败，释放内存并杀死进程
+          p->killed = 1;
+        }
+      }
+    }
   } else {
     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
     printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
