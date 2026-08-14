@@ -316,6 +316,39 @@ sys_open(void)
     }
   }
 
+  // 如果打开的是符号链接，且没有指定 O_NOFOLLOW
+  if(ip->type == T_SYMLINK && !(omode & O_NOFOLLOW)){
+    int depth = 0; // 防止软链接成环（死循环），限制最大深度
+    
+    // 循环解包，应对“链接指向链接”的情况
+    while(ip->type == T_SYMLINK){
+      if(depth >= 10){
+        iunlockput(ip);
+        end_op();
+        return -1;
+      }
+      
+      char target[MAXPATH];
+      // 读出里面存储的目标路径
+      if(readi(ip, 0, (uint64)target, 0, MAXPATH) <= 0){
+        iunlockput(ip);
+        end_op();
+        return -1;
+      }
+      
+      iunlockput(ip); // 放开当前的链接文件
+      
+      // 解析目标路径，拿到真正的 inode
+      if((ip = namei(target)) == 0){
+        end_op();
+        return -1;
+      }
+      
+      ilock(ip); // 重新上锁新的 inode 准备下一轮检查
+      depth++;
+    }
+  }
+
   if(ip->type == T_DEVICE && (ip->major < 0 || ip->major >= NDEV)){
     iunlockput(ip);
     end_op();
@@ -482,5 +515,37 @@ sys_pipe(void)
     fileclose(wf);
     return -1;
   }
+  return 0;
+}
+
+// symlink 系统调用
+uint64
+sys_symlink(void)
+{
+  char target[MAXPATH], path[MAXPATH];
+  struct inode *ip;
+
+  // 获取目标路径和软链接存放路径
+  if(argstr(0, target, MAXPATH) < 0 || argstr(1, path, MAXPATH) < 0)
+    return -1;
+
+  begin_op(); // 开启事务
+
+  // 在 path 位置创建一个类型为 T_SYMLINK 的新 inode
+  if((ip = create(path, T_SYMLINK, 0, 0)) == 0){
+    end_op();
+    return -1;
+  }
+
+  // 将 target 字符串（目标路径）写入 inode 的第一个数据块中
+  if(writei(ip, 0, (uint64)target, 0, strlen(target)) != strlen(target)){
+    iunlockput(ip); // 解锁并减少引用
+    end_op();
+    return -1;
+  }
+
+  iunlockput(ip);
+  end_op();
+  
   return 0;
 }

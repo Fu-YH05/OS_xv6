@@ -400,7 +400,34 @@ bmap(struct inode *ip, uint bn)
     brelse(bp);
     return addr;
   }
+  bn -= NINDIRECT;
 
+  // 3. Doubly-indirect blocks
+  if(bn < NINDIRECT * NINDIRECT){
+    // 3.1 载入二级间接块的顶层块 (分配如果需要)
+    if((addr = ip->addrs[NDIRECT+1]) == 0)
+      ip->addrs[NDIRECT+1] = addr = balloc(ip->dev);
+    
+    // 3.2 找到一级目录的块号
+    bp = bread(ip->dev, addr);
+    a = (uint*)bp->data;
+    if((addr = a[bn / NINDIRECT]) == 0){
+      a[bn / NINDIRECT] = addr = balloc(ip->dev);
+      log_write(bp);
+    }
+    brelse(bp);
+
+    // 3.3 根据一级目录的块号，深入找到最终数据块
+    bp = bread(ip->dev, addr);
+    a = (uint*)bp->data;
+    if((addr = a[bn % NINDIRECT]) == 0){
+      a[bn % NINDIRECT] = addr = balloc(ip->dev);
+      log_write(bp);
+    }
+    brelse(bp);
+    
+    return addr;
+  }
   panic("bmap: out of range");
 }
 
@@ -431,7 +458,28 @@ itrunc(struct inode *ip)
     bfree(ip->dev, ip->addrs[NDIRECT]);
     ip->addrs[NDIRECT] = 0;
   }
-
+  // 释放 Doubly-indirect blocks
+  if(ip->addrs[NDIRECT+1]){
+    struct buf *bp1 = bread(ip->dev, ip->addrs[NDIRECT+1]);
+    uint *a1 = (uint*)bp1->data;
+    // 遍历每一个一级间接块
+    for(i = 0; i < NINDIRECT; i++){
+      if(a1[i]){
+        struct buf *bp2 = bread(ip->dev, a1[i]);
+        uint *a2 = (uint*)bp2->data;
+        // 遍历一级间接块里的每一个直接块
+        for(j = 0; j < NINDIRECT; j++){
+          if(a2[j])
+            bfree(ip->dev, a2[j]);
+        }
+        brelse(bp2);
+        bfree(ip->dev, a1[i]); // 释放这个一级间接块本身
+      }
+    }
+    brelse(bp1);
+    bfree(ip->dev, ip->addrs[NDIRECT+1]); // 释放顶层目录块本身
+    ip->addrs[NDIRECT+1] = 0;
+  }
   ip->size = 0;
   iupdate(ip);
 }
