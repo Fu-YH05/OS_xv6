@@ -311,7 +311,7 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   pte_t *pte;
   uint64 pa, i;
   uint flags;
-  char *mem;
+  //char *mem;
 
   for(i = 0; i < sz; i += PGSIZE){
     if((pte = walk(old, i, 0)) == 0)
@@ -320,13 +320,20 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
       panic("uvmcopy: page not present");
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
+    //if((mem = kalloc()) == 0)
+      //goto err;
+    //memmove(mem, (char*)pa, PGSIZE);
+    // 如果页面可写，则剥夺写权限，打上 COW 标记
+    if(flags & PTE_W) {
+      flags = (flags | PTE_COW) & ~PTE_W;
+      *pte = PA2PTE(pa) | flags; // 更新父进程的 PTE
+    }
+    if(mappages(new, i, PGSIZE, pa, flags) != 0){
+      //kfree(mem);直接将相同的物理页映射给子进程，而非 kalloc 分配新页
       goto err;
     }
+    // 引用计数加 1
+    cow_ref_add((void*)pa);
   }
   return 0;
 
@@ -355,9 +362,22 @@ int
 copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 {
   uint64 n, va0, pa0;
+  pte_t *pte;
 
   while(len > 0){
     va0 = PGROUNDDOWN(dstva);
+    // 检查目标地址是不是 COW 页面
+    if(va0 >= MAXVA) return -1;
+    pte = walk(pagetable, va0, 0);
+    if(pte != 0 && (*pte & PTE_V) && (*pte & PTE_U)) {
+      if(*pte & PTE_COW) {
+        // 如果是，主动触发内存分配与替换
+        if(cow_page_fault(pagetable, va0) < 0)
+          return -1;
+      }
+    } else {
+      return -1;
+    }
     pa0 = walkaddr(pagetable, va0);
     if(pa0 == 0)
       return -1;
@@ -439,4 +459,39 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
   } else {
     return -1;
   }
+}
+
+// [新增] 处理 COW 缺页，返回 0 代表成功，-1 失败
+int
+cow_page_fault(pagetable_t pagetable, uint64 va)
+{
+  if(va >= MAXVA) return -1;
+  va = PGROUNDDOWN(va);
+  
+  pte_t *pte = walk(pagetable, va, 0);
+  if(pte == 0 || (*pte & PTE_V) == 0 || (*pte & PTE_U) == 0) 
+    return -1;
+    
+  // 必须是我们在 uvmcopy 标记好的 COW 页
+  if((*pte & PTE_COW) == 0) 
+    return -1; 
+    
+  uint64 old_pa = PTE2PA(*pte);
+  
+  // 申请一个新的物理页
+  char *new_mem = kalloc();
+  if(new_mem == 0) return -1; // 提示: if there's no free memory, process should be killed
+  
+  // 将旧页的数据复制到新页
+  memmove(new_mem, (char*)old_pa, PGSIZE);
+  
+  // 更新该虚拟地址的 PTE，指向新页，恢复写权限，抹去 COW 标记
+  uint flags = PTE_FLAGS(*pte);
+  flags = (flags & ~PTE_COW) | PTE_W;
+  *pte = PA2PTE(new_mem) | flags;
+  
+  // 释放原先的旧页（其内部会做引用计数减一处理）
+  kfree((void*)old_pa);
+  
+  return 0;
 }

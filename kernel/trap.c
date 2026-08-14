@@ -67,6 +67,12 @@ usertrap(void)
     syscall();
   } else if((which_dev = devintr()) != 0){
     // ok
+  } else if(r_scause() == 15) {
+    // 处理写入时的缺页异常 (Copy-On-Write)
+    uint64 fault_va = r_stval();
+    if(fault_va >= p->sz || cow_page_fault(p->pagetable, fault_va) < 0) {
+      p->killed = 1; // 越界或无内存可用，杀死进程
+    }
   } else {
     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
     printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());

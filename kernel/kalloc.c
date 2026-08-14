@@ -23,10 +23,21 @@ struct {
   struct run *freelist;
 } kmem;
 
+struct {
+  struct spinlock lock;
+  int count[PHYSTOP / PGSIZE]; // 每个物理页对应一个引用计数
+} cow_ref;
+
 void
 kinit()
 {
   initlock(&kmem.lock, "kmem");
+  // 初始化引用计数锁
+  initlock(&cow_ref.lock, "cow_ref");
+  // 在 kfree 被 freerange 调用前，将所有可用页的计数置为 1
+  for(int i = 0; i < PHYSTOP / PGSIZE; i++) {
+    cow_ref.count[i] = 1;
+  }
   freerange(end, (void*)PHYSTOP);
 }
 
@@ -37,6 +48,17 @@ freerange(void *pa_start, void *pa_end)
   p = (char*)PGROUNDUP((uint64)pa_start);
   for(; p + PGSIZE <= (char*)pa_end; p += PGSIZE)
     kfree(p);
+}
+
+// [新增] 供外部调用的引用计数增加函数
+void cow_ref_add(void *pa) {
+  // 严格边界检查
+  if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
+    return;
+    
+  acquire(&cow_ref.lock);
+  cow_ref.count[(uint64)pa / PGSIZE]++;
+  release(&cow_ref.lock);
 }
 
 // Free the page of physical memory pointed at by v,
@@ -50,6 +72,15 @@ kfree(void *pa)
 
   if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
     panic("kfree");
+
+  // 递减引用计数
+  acquire(&cow_ref.lock);
+  int c = --cow_ref.count[(uint64)pa / PGSIZE];
+  release(&cow_ref.lock);
+
+  // 如果计数大于 0，说明还有进程在使用，直接返回，不释放内存
+  if(c > 0) return; 
+  if(c < 0) panic("kfree: ref count below 0");
 
   // Fill with junk to catch dangling refs.
   memset(pa, 1, PGSIZE);
@@ -76,7 +107,13 @@ kalloc(void)
     kmem.freelist = r->next;
   release(&kmem.lock);
 
-  if(r)
+  if(r){
     memset((char*)r, 5, PGSIZE); // fill with junk
-  return (void*)r;
+    // 分配出新页时，引用计数设为 1
+    acquire(&cow_ref.lock);
+    cow_ref.count[(uint64)r / PGSIZE] = 1;
+    release(&cow_ref.lock);
+  }
+    return (void*)r;
 }
+
