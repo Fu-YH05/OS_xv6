@@ -1,1 +1,28 @@
-All answers go here.
+1. 结合课本图 3-4 解释 vmprint 的输出：第 0 页包含什么？第 2 页是
+   什么？运行在用户态时，进程能否读写第 1 页映射的内存？
+
+   vmprint 打印的是第一个进程（init）在 exec() 完成装载之后的三级
+   RISC-V 页表。对照图 3-4：
+
+   - 第 0 页包含进程的 text 和 data（用户地址空间的最低几页，由
+     exec 从可执行文件中载入）。
+   - 第 2 页是用户栈，由 exec 分配。
+   - 第 1 页是用户栈下方的 guard page。它的 PTE 有效但 PTE_U 位被
+     清除，因此用户态进程既不能读也不能写它。访问到它（例如栈
+     溢出）时会触发缺页，而不是静默覆盖相邻内存。
+
+2. 解释 copyin_new() 中第三个测试 srcva + len 为什么必要：给出 srcva
+   和 len 的一组取值，使得前两个测试不成立（即不会导致返回 -1），
+   但第三个测试成立（导致返回 -1）。
+
+   前两个测试是 srcva >= p->sz 和 srcva+len >= p->sz。它们拦不住
+   srcva+len 溢出回绕的情况（整数溢出）：len 足够大时，srcva+len
+   回绕成一个小值，从而通过前两个范围检查，随后 memmove 会从一个
+   错误的（回绕后的）地址范围读取。第三个测试拦截的正是这种回绕。
+
+   例子：srcva = 0x1000，len = 0xfffffffffffff000（即 2^64 - 0x1000）。
+   此时 srcva + len = 0，于是
+     - 测试 1 不成立：srcva = 0x1000 < p->sz；
+     - 测试 2 不成立：srcva+len = 0 < p->sz；
+     - 测试 3 成立：0 = srcva+len < srcva = 0x1000，copyin_new
+       返回 -1。
