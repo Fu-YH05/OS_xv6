@@ -27,6 +27,7 @@
 #define NBUCKET 13
 
 struct {
+  struct spinlock eviction_lock; // 全局锁：用于串行化缓存未命中时的淘汰过程
   struct spinlock lock[NBUCKET]; // 每个哈希桶独立的一把锁
   struct buf buf[NBUF];
   struct buf head[NBUCKET];      // 哈希桶链表数组
@@ -35,6 +36,8 @@ struct {
 void
 binit(void)
 {
+  initlock(&bcache.eviction_lock, "bcache");
+
   // 初始化每个哈希桶
   for(int i = 0; i < NBUCKET; i++) {
     initlock(&bcache.lock[i], "bcache");
@@ -42,11 +45,12 @@ binit(void)
     bcache.head[i].next = &bcache.head[i];
   }
   
-  // 初始化时，将所有初始缓存块均匀分配到 13 个桶中
+  // 【优化 1：均匀发牌】将所有初始缓存块均匀散列到 13 个桶中，杜绝初期争抢
   for(int i = 0; i < NBUF; i++){
     struct buf *b = &bcache.buf[i];
     initsleeplock(&b->lock, "buffer");
-    int id = i % NBUCKET;
+    b->timestamp = 0;
+    int id = i % NBUCKET; // 均匀分配
     b->next = bcache.head[id].next;
     b->prev = &bcache.head[id];
     bcache.head[id].next->prev = b;
@@ -89,8 +93,8 @@ bget(uint dev, uint blockno)
     }
   }
   panic("bget: no buffers");*/
-retry:
-  // 1. 高速路径：尝试在对应的哈希桶中查找
+
+  // 1. 高速路径：尝试在对应的哈希桶中查找（仅锁定当前桶）
   acquire(&bcache.lock[id]);
   for(b = bcache.head[id].next; b != &bcache.head[id]; b = b->next){
     if(b->dev == dev && b->blockno == blockno){
@@ -100,87 +104,102 @@ retry:
       return b;
     }
   }
-  release(&bcache.lock[id]);
 
-  // 2. 缓存未命中：无状态扫描寻找全局 LRU
-  struct buf *victim = 0;
-  int victim_bucket = -1;
-  uint min_ticks = (uint)-1;
+  // 2. 缓存未命中时，绝不立刻动用全局锁！
+  // 优先扫描当前自己的桶里有没有空闲块，如果有，直接拿来用
+  struct buf *lru_buf = 0;
+  uint min_ticks = (uint)-1; 
 
-  for(int i = 0; i < NBUCKET; i++){
-    acquire(&bcache.lock[i]);
-    for(b = bcache.head[i].next; b != &bcache.head[i]; b = b->next){
-      if(b->refcnt == 0 && b->timestamp < min_ticks){
-        min_ticks = b->timestamp;
-        victim = b;
-        victim_bucket = i;
-      }
+  for(b = bcache.head[id].next; b != &bcache.head[id]; b = b->next){
+    if(b->refcnt == 0 && b->timestamp < min_ticks){
+      min_ticks = b->timestamp;
+      lru_buf = b;
     }
-    release(&bcache.lock[i]);
   }
 
-  if(victim == 0){
+  if(lru_buf){
+    lru_buf->dev = dev;
+    lru_buf->blockno = blockno;
+    lru_buf->valid = 0;
+    lru_buf->refcnt = 1;
+    release(&bcache.lock[id]);
+    acquiresleep(&lru_buf->lock);
+    return lru_buf;
+  }
+
+  release(&bcache.lock[id]); // 当前桶真的没资源了，释放它，准备安全地遍历所有桶寻找 LRU
+
+  // 3. 真正需要跨桶驱逐：获取全局驱逐锁
+  acquire(&bcache.eviction_lock);
+  
+  // 二次校验：在等待全局锁的期间，另一个进程可能已经把这块磁盘加载进来了
+  acquire(&bcache.lock[id]);
+  for(b = bcache.head[id].next; b != &bcache.head[id]; b = b->next){
+    if(b->dev == dev && b->blockno == blockno){
+      b->refcnt++;
+      release(&bcache.lock[id]);
+      release(&bcache.eviction_lock);
+      acquiresleep(&b->lock);
+      return b;
+    }
+  }
+  release(&bcache.lock[id]);
+
+  lru_buf = 0;
+  int lru_bucket = -1;
+  uint min_ticks = (uint)-1; 
+
+  // 4. 按照 0 到 NBUCKET-1 的顺序遍历寻找全局 LRU（按顺序加锁可绝对避免死锁）
+  for(int i = 0; i < NBUCKET; i++){
+    acquire(&bcache.lock[i]);
+    int found_new_min = 0;
+    
+    for(b = bcache.head[i].next; b != &bcache.head[i]; b = b->next){
+      // 引用计数为 0 代表空闲
+      if(b->refcnt == 0 && b->timestamp < min_ticks){
+        min_ticks = b->timestamp;
+        lru_buf = b;
+        found_new_min = 1;
+      }
+    }
+    
+    // 如果在这个桶中找到了更小的 LRU 块
+    if(found_new_min){
+      if(lru_bucket != -1){
+        release(&bcache.lock[lru_bucket]); // 释放之前持有的、不是最小的那个桶的锁
+      }
+      lru_bucket = i; // 保留当前包含最小 LRU 块的桶的锁
+    } else {
+      release(&bcache.lock[i]); // 在这个桶里没找到更小的，直接释放
+    }
+  }
+
+  if(lru_buf == 0){
     panic("bget: no buffers");
   }
 
-  // 3. 严格锁排序 (Lock Ordering)：永远先获取索引较小的锁，杜绝死锁
-  if(victim_bucket < id){
-    acquire(&bcache.lock[victim_bucket]);
-    acquire(&bcache.lock[id]);
-  } else if(victim_bucket > id){
-    acquire(&bcache.lock[id]);
-    acquire(&bcache.lock[victim_bucket]);
-  } else {
-    // 都在同一个桶里
-    acquire(&bcache.lock[id]);
-  }
+  // 此时，我们仍然且仅持有 lru_bucket 的锁！安全地将其从旧桶中解绑
+  lru_buf->prev->next = lru_buf->next;
+  lru_buf->next->prev = lru_buf->prev;
+  release(&bcache.lock[lru_bucket]);
 
-  // 二次安全校验1：在我们刚才没拿锁的时候，有没有别人已经把我们要的 blockno 加载进来了？
-  int hit = 0;
-  for(b = bcache.head[id].next; b != &bcache.head[id]; b = b->next){
-    if(b->dev == dev && b->blockno == blockno){
-      hit = 1;
-      break;
-    }
-  }
+  // 5. 将提取出来的空闲块插入到我们需要的新桶 (id) 中
+  acquire(&bcache.lock[id]);
+  lru_buf->next = bcache.head[id].next;
+  lru_buf->prev = &bcache.head[id];
+  bcache.head[id].next->prev = lru_buf;
+  bcache.head[id].next = lru_buf;
   
-  if(hit){
-    // 被别人捷足先登加载了，直接用别人加载好的
-    b->refcnt++;
-    if(victim_bucket != id) release(&bcache.lock[victim_bucket]);
-    release(&bcache.lock[id]);
-    acquiresleep(&b->lock);
-    return b;
-  }
+  lru_buf->dev = dev;
+  lru_buf->blockno = blockno;
+  lru_buf->valid = 0;
+  lru_buf->refcnt = 1;
+  release(&bcache.lock[id]);
+  
+  release(&bcache.eviction_lock);
 
-  // 二次安全校验2：我们的 victim 猎物在这期间有没有被别人抢走？
-  if(victim->refcnt == 0){
-    // 猎物还在！放心地偷走它
-    if(victim_bucket != id){
-      // 从旧的桶中摘除
-      victim->prev->next = victim->next;
-      victim->next->prev = victim->prev;
-      // 挂载到我们的新桶中
-      victim->next = bcache.head[id].next;
-      victim->prev = &bcache.head[id];
-      bcache.head[id].next->prev = victim;
-      bcache.head[id].next = victim;
-    }
-    victim->dev = dev;
-    victim->blockno = blockno;
-    victim->valid = 0;
-    victim->refcnt = 1;
-    
-    if(victim_bucket != id) release(&bcache.lock[victim_bucket]);
-    release(&bcache.lock[id]);
-    acquiresleep(&victim->lock);
-    return victim;
-  } else {
-    // 猎物被别人抢先一步使用了！没办法，释放锁，从头再来一次
-    if(victim_bucket != id) release(&bcache.lock[victim_bucket]);
-    release(&bcache.lock[id]);
-    goto retry;
-  }
+  acquiresleep(&lru_buf->lock);
+  return lru_buf;
 }
 
 // Return a locked buf with the contents of the indicated block.
