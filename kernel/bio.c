@@ -147,7 +147,7 @@ bget(uint dev, uint blockno)
 
   lru_buf = 0;
   int lru_bucket = -1;
-  uint min_ticks = (uint)-1; 
+  min_ticks = -1; 
 
   // 4. 按照 0 到 NBUCKET-1 的顺序遍历寻找全局 LRU（按顺序加锁可绝对避免死锁）
   for(int i = 0; i < NBUCKET; i++){
